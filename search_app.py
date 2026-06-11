@@ -32,6 +32,7 @@ import pickle
 import shutil
 import tempfile
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +80,39 @@ def embed(img: Image.Image) -> np.ndarray:
 def normalize(vec: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(vec)
     return vec / n if n > 0 else vec
+
+
+# ── Date helpers ─────────────────────────────────────────────────────────────
+
+_EXIF_DATE_TAGS = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, DateTime
+_EXIF_FMT = "%Y:%m:%d %H:%M:%S"
+
+
+def get_media_date(path) -> datetime | None:
+    """Return the best-available date for a media file.
+    Order: EXIF DateTimeOriginal → EXIF DateTime → file mtime."""
+    p = Path(path)
+    if p.suffix.lower() in SUPPORTED:
+        try:
+            img = Image.open(p)
+            exif = img._getexif() or {}
+            for tag in _EXIF_DATE_TAGS:
+                val = exif.get(tag)
+                if val:
+                    try:
+                        return datetime.strptime(val[:19], _EXIF_FMT)
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+    try:
+        return datetime.fromtimestamp(p.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def fmt_date(dt: datetime | None) -> str:
+    return dt.strftime("%Y-%m-%d") if dt else ""
 
 
 # ── Image loading helpers ─────────────────────────────────────────────────────
@@ -200,7 +234,7 @@ def build_index(photos_dir: Path) -> dict:
         return {}
 
     bar = st.progress(0.0, text="Building index…")
-    valid_paths, vectors = [], []
+    valid_paths, vectors, dates = [], [], []
     video_thumbs: dict[str, bytes] = {}
     skipped_videos = 0
     for i, p in enumerate(paths):
@@ -221,12 +255,14 @@ def build_index(photos_dir: Path) -> dict:
                 continue
             vectors.append(embed(img))
             valid_paths.append(str(p))
+        dates.append(get_media_date(p))
     bar.empty()
 
     index = {
         "paths": valid_paths,
         "embeddings": np.array(vectors, dtype=np.float32),
         "video_thumbs": video_thumbs,
+        "dates": dates,
     }
     (photos_dir / INDEX_FILENAME).write_bytes(pickle.dumps(index))
     n_vid = len(video_thumbs)
@@ -311,10 +347,13 @@ def outlier_indices(gt: dict, keep_pct: float) -> list[int]:
 # ── Search & classification ───────────────────────────────────────────────────
 
 def rank(query_vec: np.ndarray, index: dict, top_k: int,
-         skip: set | None = None, media: str = "All"):
+         skip: set | None = None, media: str = "All",
+         years: set | None = None) -> list[tuple]:
+    """Returns list of (path, score, date_or_None)."""
     scores = index["embeddings"] @ query_vec
     order = np.argsort(scores)[::-1]
     skip = skip or set()
+    index_dates = index.get("dates", [None] * len(index["paths"]))
     out = []
     for i in order:
         p = index["paths"][i]
@@ -322,13 +361,16 @@ def rank(query_vec: np.ndarray, index: dict, top_k: int,
             continue
         if media == "Images only" and is_video(p):
             continue
+        dt = index_dates[i] if i < len(index_dates) else None
+        if years and (dt is None or dt.year not in years):
+            continue
         try:
             resolved = str(Path(p).resolve())
         except Exception:
             resolved = p
         if resolved in skip:
             continue
-        out.append((p, float(scores[i])))
+        out.append((p, float(scores[i]), dt))
         if len(out) >= top_k:
             break
     return out
@@ -369,17 +411,22 @@ def export_classification(index: dict, labels: list, out_dir: Path) -> dict:
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
-def show_results(results: list, cols_count: int, index: dict | None = None):
+def show_results(results: list, cols_count: int, index: dict | None = None,
+                 show_score: bool = True):
     if not results:
         st.warning("No matches.")
         return
     video_thumbs = (index or {}).get("video_thumbs", {})
     st.markdown(f"**{len(results)} matches**")
     grid = st.columns(cols_count)
-    for i, (path, score) in enumerate(results):
+    for i, row in enumerate(results):
+        path, score = row[0], row[1]
+        dt: datetime | None = row[2] if len(row) > 2 else None
+        date_str = fmt_date(dt)
+        score_str = f"{score:.2f} · " if show_score else ""
         with grid[i % cols_count]:
             if is_video(path):
-                caption = f"🎬 {score:.2f} · {Path(path).name}"
+                caption = f"🎬 {score_str}{date_str}\n{Path(path).name}"
                 thumb = video_thumbs.get(path)
                 if thumb is None and HAS_CV2:
                     frames = sample_video_frames(path, 1)
@@ -394,7 +441,7 @@ def show_results(results: list, cols_count: int, index: dict | None = None):
                 img = load_image_safe(path)
                 if img is None:
                     continue
-                st.image(img, caption=f"{score:.2f} · {Path(path).name}",
+                st.image(img, caption=f"{score_str}{date_str}\n{Path(path).name}",
                          width="stretch")
 
 
@@ -442,6 +489,18 @@ def main():
         cols_count = st.select_slider("Columns", options=[3, 4, 5, 6, 7, 8], value=6)
         media_filter = st.radio("Result type", ["All", "Images only", "Videos only"],
                                 horizontal=True)
+        # Year filter — populated once an index is loaded.
+        year_filter: set | None = None
+        _idx_for_years = st.session_state.get("index")
+        if _idx_for_years:
+            _all_dates = _idx_for_years.get("dates", [])
+            _all_years = sorted({d.year for d in _all_dates if d}, reverse=True)
+            if _all_years:
+                st.divider()
+                _sel = st.multiselect("Filter by year", _all_years,
+                                      placeholder="All years")
+                if _sel:
+                    year_filter = set(_sel)
         if not HAS_CV2:
             st.divider()
             st.caption("🎬 Video support is off — run "
@@ -482,8 +541,8 @@ def main():
             st.session_state["index"] = build_index(photos_dir)
             index = st.session_state["index"]
 
-    tab_search, tab_groups, tab_classify = st.tabs(
-        ["🔍 Search by image", "🏷️ Group types", "🗂️ Classify library"]
+    tab_search, tab_groups, tab_classify, tab_date = st.tabs(
+        ["🔍 Search by media", "🏷️ Group types", "🗂️ Classify library", "📅 Browse by date"]
     )
 
     # ── Tab 1: search by one or more example images/videos ───────────────────
@@ -538,7 +597,8 @@ def main():
 
             if index:
                 qvec = normalize(np.mean([q[1] for q in queries], axis=0))
-                show_results(rank(qvec, index, top_k, skip=skip, media=media_filter),
+                show_results(rank(qvec, index, top_k, skip=skip,
+                                  media=media_filter, years=year_filter),
                              cols_count, index)
             else:
                 st.info("Build the index first (button above).")
@@ -664,7 +724,7 @@ def main():
                             except Exception:
                                 pass
                 show_results(rank(prototype(gts[chosen]), index, top_k, skip=skip,
-                                  media=media_filter),
+                                  media=media_filter, years=year_filter),
                              cols_count, index)
 
     # ── Tab 3: classify the whole library ─────────────────────────────────────
@@ -704,6 +764,88 @@ def main():
                     result = export_classification(index, labels, Path(out_str))
                     st.success(f"Exported {sum(result.values()):,} files to {out_str}")
                     st.json(result)
+
+    # ── Tab 4: browse by date ─────────────────────────────────────────────────
+    with tab_date:
+        if not index:
+            st.info("Build the index first (button above).")
+        else:
+            index_dates = index.get("dates", [])
+            if not any(index_dates):
+                st.warning("No date information found in the index — "
+                           "rebuild the index to populate dates.")
+            else:
+                # Build a {year: {month: [(path, date)]}} structure.
+                from collections import defaultdict
+                by_year: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+                for path, dt in zip(index["paths"], index_dates):
+                    if dt:
+                        by_year[dt.year][dt.month].append((path, dt))
+                    else:
+                        by_year[0][0].append((path, None))
+
+                all_years = sorted(by_year.keys(), reverse=True)
+                year_labels = [str(y) if y else "Unknown date" for y in all_years]
+
+                d1, d2 = st.columns([1, 3])
+                with d1:
+                    chosen_label = st.radio("Year", year_labels)
+                    chosen_year = all_years[year_labels.index(chosen_label)]
+                    months = sorted(by_year[chosen_year].keys())
+                    month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",
+                                   6:"Jun",7:"Jul",8:"Aug",9:"Sep",
+                                   10:"Oct",11:"Nov",12:"Dec",0:"Unknown"}
+                    chosen_month = st.radio(
+                        "Month",
+                        [0] + months,
+                        format_func=lambda m: "All months" if m == 0
+                            else f"{month_names[m]} ({len(by_year[chosen_year][m])})",
+                    )
+                    total_year = sum(len(v) for v in by_year[chosen_year].values())
+                    st.caption(f"{total_year:,} files in {chosen_label}")
+
+                with d2:
+                    if chosen_month == 0:
+                        items = []
+                        for m in months:
+                            items.extend(by_year[chosen_year][m])
+                    else:
+                        items = by_year[chosen_year][chosen_month]
+
+                    # Sort chronologically within selection.
+                    items.sort(key=lambda x: x[1] or datetime.min)
+                    st.markdown(f"**{len(items):,} files**  "
+                                f"— {chosen_label}"
+                                + (f" / {month_names[chosen_month]}" if chosen_month else ""))
+
+                    video_thumbs = index.get("video_thumbs", {})
+                    grid = st.columns(cols_count)
+                    for idx, (path, dt) in enumerate(items[:top_k]):
+                        with grid[idx % cols_count]:
+                            date_str = fmt_date(dt)
+                            if is_video(path):
+                                thumb = video_thumbs.get(path)
+                                if thumb is None and HAS_CV2:
+                                    frames = sample_video_frames(path, 1)
+                                    thumb = make_thumb(frames[0], POSTER_SIZE) if frames else None
+                                if thumb:
+                                    st.image(thumb,
+                                             caption=f"🎬 {date_str}\n{Path(path).name}",
+                                             width="stretch")
+                                else:
+                                    st.caption(f"🎬 {Path(path).name}")
+                                with st.expander("▶ Play"):
+                                    st.video(path)
+                            else:
+                                img = load_image_safe(path)
+                                if img:
+                                    st.image(img,
+                                             caption=f"{date_str}\n{Path(path).name}",
+                                             width="stretch")
+
+                    if len(items) > top_k:
+                        st.caption(f"Showing first {top_k} of {len(items):,}. "
+                                   "Increase 'Results to show' in the sidebar to see more.")
 
 
 if __name__ == "__main__":
