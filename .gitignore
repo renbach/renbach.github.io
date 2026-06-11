@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+.image_index.pkl
+.group_types.pkl
