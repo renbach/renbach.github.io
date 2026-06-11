@@ -290,13 +290,18 @@ def outlier_indices(gt: dict, keep_pct: float) -> list[int]:
 
 # ── Search & classification ───────────────────────────────────────────────────
 
-def rank(query_vec: np.ndarray, index: dict, top_k: int, skip: set | None = None):
+def rank(query_vec: np.ndarray, index: dict, top_k: int,
+         skip: set | None = None, media: str = "All"):
     scores = index["embeddings"] @ query_vec
     order = np.argsort(scores)[::-1]
     skip = skip or set()
     out = []
     for i in order:
         p = index["paths"][i]
+        if media == "Videos only" and not is_video(p):
+            continue
+        if media == "Images only" and is_video(p):
+            continue
         try:
             resolved = str(Path(p).resolve())
         except Exception:
@@ -360,7 +365,7 @@ def show_results(results: list, cols_count: int, index: dict | None = None):
                     frames = sample_video_frames(path, 1)
                     thumb = make_thumb(frames[0], POSTER_SIZE) if frames else None
                 if thumb is not None:
-                    st.image(thumb, caption=caption, width=400)
+                    st.image(thumb, caption=caption, width="stretch")
                 else:
                     st.caption(caption)
                 with st.expander("▶ Play"):
@@ -370,7 +375,7 @@ def show_results(results: list, cols_count: int, index: dict | None = None):
                 if img is None:
                     continue
                 st.image(img, caption=f"{score:.2f} · {Path(path).name}",
-                         width=700)
+                         width="stretch")
 
 
 def gather_examples(uploaded, folder_str: str) -> list[tuple]:
@@ -415,6 +420,8 @@ def main():
         st.header("Display")
         top_k = st.slider("Results to show", 5, 120, 24, 1)
         cols_count = st.select_slider("Columns", options=[3, 4, 5, 6, 7, 8], value=6)
+        media_filter = st.radio("Result type", ["All", "Images only", "Videos only"],
+                                horizontal=True)
         if not HAS_CV2:
             st.divider()
             st.caption("🎬 Video support is off — run "
@@ -451,7 +458,7 @@ def main():
         else:
             st.warning("No index found for this folder yet — build one.")
     with c2:
-        if st.button("Build / Rebuild index", use_container_width=True):
+        if st.button("Build / Rebuild index", width="stretch"):
             st.session_state["index"] = build_index(photos_dir)
             index = st.session_state["index"]
 
@@ -511,7 +518,8 @@ def main():
 
             if index:
                 qvec = normalize(np.mean([q[1] for q in queries], axis=0))
-                show_results(rank(qvec, index, top_k, skip=skip), cols_count, index)
+                show_results(rank(qvec, index, top_k, skip=skip, media=media_filter),
+                             cols_count, index)
             else:
                 st.info("Build the index first (button above).")
 
@@ -635,7 +643,8 @@ def main():
                                 skip.add(str(Path(p).resolve()))
                             except Exception:
                                 pass
-                show_results(rank(prototype(gts[chosen]), index, top_k, skip=skip),
+                show_results(rank(prototype(gts[chosen]), index, top_k, skip=skip,
+                                  media=media_filter),
                              cols_count, index)
 
     # ── Tab 3: classify the whole library ─────────────────────────────────────
@@ -665,7 +674,7 @@ def main():
                     for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
                 ]
                 st.markdown(f"**Results · {total:,} files**")
-                st.dataframe(rows, use_container_width=True, hide_index=True)
+                st.dataframe(rows, width="stretch", hide_index=True)
 
                 st.divider()
                 default_out = str(photos_dir.parent / (photos_dir.name + "_sorted"))
