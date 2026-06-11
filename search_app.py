@@ -165,6 +165,25 @@ def add_references(gts: dict, name: str, items: list[tuple]) -> None:
         gt["paths"].extend(paths)
 
 
+def remove_references(gts: dict, name: str, indices: list[int]) -> None:
+    """Remove examples at the given indices; deletes the type if it becomes empty."""
+    gt = gts[name]
+    for i in sorted(set(indices), reverse=True):
+        gt["names"].pop(i)
+        gt["thumbs"].pop(i)
+        gt["paths"].pop(i)
+        gt["embeddings"] = np.delete(gt["embeddings"], i, axis=0)
+    if gt["embeddings"].shape[0] == 0:
+        del gts[name]
+
+
+def outlier_indices(gt: dict, keep_pct: float) -> list[int]:
+    """Indices of the bottom (1-keep_pct) examples ranked by similarity to prototype."""
+    sims = gt["embeddings"] @ prototype(gt)
+    n_remove = max(0, int(round(len(sims) * (1.0 - keep_pct))))
+    return list(np.argsort(sims)[:n_remove].tolist())
+
+
 # ── Search & classification ───────────────────────────────────────────────────
 
 def rank(query_vec: np.ndarray, index: dict, top_k: int, skip: set | None = None):
@@ -374,17 +393,69 @@ def main():
                 st.caption("None defined yet.")
             for gname in list(gts.keys()):
                 gt = gts[gname]
-                with st.expander(f"{gname} · {len(gt['embeddings'])} examples"):
+                n_ex = len(gt["embeddings"])
+                with st.expander(f"{gname} · {n_ex} examples"):
                     thumbs = gt.get("thumbs", [])
+                    names_list = gt.get("names", [])
+
+                    # Thumbnail grid (numbered so users can cross-reference).
+                    preview_n = min(len(thumbs), 30)
                     tcols = st.columns(6)
-                    for i, th in enumerate(thumbs[:18]):
-                        tcols[i % 6].image(th)
-                    if len(thumbs) > 18:
-                        st.caption(f"…and {len(thumbs) - 18} more.")
-                    b1, b2 = st.columns(2)
+                    for i in range(preview_n):
+                        tcols[i % 6].image(thumbs[i], caption=f"#{i}")
+                    if len(thumbs) > preview_n:
+                        st.caption(f"…and {len(thumbs) - preview_n} more.")
+
+                    st.divider()
+
+                    # ── Manual removal ────────────────────────────────────
+                    options = [f"#{i} · {nm}" for i, nm in enumerate(names_list)]
+                    to_remove = st.multiselect(
+                        "Select examples to remove", options, key=f"rm_{gname}",
+                        help="Pick by number — the #s match the thumbnail captions above.",
+                    )
+                    manual_indices = [int(o.split("·")[0].strip("# ")) for o in to_remove]
+
+                    # ── Auto-prune ────────────────────────────────────────
+                    keep_pct = st.slider(
+                        "Auto-prune: keep top % by closeness to centroid",
+                        10, 100, 80, 5, key=f"prune_{gname}", format="%d%%",
+                        help="Lower = remove more outliers. 80% keeps the 80% most "
+                             "representative examples and flags the rest.",
+                    )
+                    auto_idx = outlier_indices(gt, keep_pct / 100.0)
+                    if auto_idx:
+                        st.caption(
+                            f"{len(auto_idx)} outlier(s) flagged "
+                            f"(bottom {100 - keep_pct}% by centroid similarity): "
+                            + ", ".join(f"#{i}" for i in sorted(auto_idx)[:10])
+                            + ("…" if len(auto_idx) > 10 else "")
+                        )
+
+                    # ── Action buttons ────────────────────────────────────
+                    b1, b2, b3, b4 = st.columns(4)
                     if b1.button("🔎 Search library", key=f"use_{gname}"):
                         st.session_state["active_group"] = gname
-                    if b2.button("🗑️ Delete", key=f"del_{gname}"):
+
+                    if b2.button(
+                        f"✂️ Remove {len(to_remove)} selected",
+                        key=f"rm_sel_{gname}",
+                        disabled=not to_remove,
+                    ):
+                        remove_references(gts, gname, manual_indices)
+                        save_group_types(photos_dir, gts)
+                        st.rerun()
+
+                    if b3.button(
+                        f"🧹 Auto-prune {len(auto_idx)}",
+                        key=f"prune_btn_{gname}",
+                        disabled=not auto_idx,
+                    ):
+                        remove_references(gts, gname, auto_idx)
+                        save_group_types(photos_dir, gts)
+                        st.rerun()
+
+                    if b4.button("🗑️ Delete type", key=f"del_{gname}"):
                         del gts[gname]
                         save_group_types(photos_dir, gts)
                         st.rerun()
