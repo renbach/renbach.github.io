@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
 """
-Visual similarity search + group-type organizer.
+Visual similarity search + group-type organizer (images AND videos).
 
 Setup (one-time):
     python -m pip install streamlit Pillow numpy
+    python -m pip install opencv-python        # optional, enables video support
 
 Run:
     python -m streamlit run search_app.py
 
 What it does
 ------------
-1. Builds a one-time embedding index of a photos folder.
-2. "Search by image" — find images that look like one (or several) examples.
+1. Builds a one-time embedding index of a media folder. Videos are
+   fingerprinted by sampling several frames and averaging their embeddings.
+2. "Search by image" — find media that look like one (or several) example
+   images or videos.
 3. "Group types" — define named categories (e.g. "memes", "receipts",
-   "selfies") using MULTIPLE example images each. A group type is the averaged
-   fingerprint of its examples, so it captures a *concept* far better than any
-   single image. Search the whole library by a group type at any time.
-4. "Classify library" — assign every image to its nearest group type and
+   "selfies") using MULTIPLE example images/videos each. A group type is the
+   averaged fingerprint of its examples, so it captures a *concept* far
+   better than any single example. Search the whole library by a group type.
+4. "Classify library" — assign every file to its nearest group type and
    export the results into one folder per type.
 
-Note: the embedding here is identical to group_images.py, so an index built by
-either tool is compatible.
+Note: the image embedding is identical to group_images.py, so an image index
+built by either tool is compatible (rebuild here to add videos).
 """
 
 import io
+import os
 import pickle
 import shutil
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -33,10 +38,20 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
 SUPPORTED = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif", ".gif"}
+VIDEO_SUPPORTED = {".mp4", ".mov", ".avi", ".3gp", ".mkv", ".webm", ".m4v",
+                   ".wmv", ".mpg", ".mpeg"}
 INDEX_FILENAME = ".image_index.pkl"
 GROUP_TYPES_FILENAME = ".group_types.pkl"
 THUMB_SIZE = 96
+POSTER_SIZE = 384
+N_VIDEO_FRAMES = 5
 
 
 # ── Embedding (identical to group_images.py) ─────────────────────────────────
@@ -72,6 +87,11 @@ def collect_images(root: Path) -> list[Path]:
     return [p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED]
 
 
+def collect_media(root: Path) -> list[Path]:
+    exts = SUPPORTED | VIDEO_SUPPORTED
+    return [p for p in root.rglob("*") if p.suffix.lower() in exts]
+
+
 def load_image_safe(src) -> Image.Image | None:
     """Open a path or an uploaded file object into a fully-loaded PIL image."""
     try:
@@ -82,36 +102,120 @@ def load_image_safe(src) -> Image.Image | None:
         return None
 
 
-def make_thumb(img: Image.Image) -> bytes:
+def make_thumb(img: Image.Image, size: int = THUMB_SIZE) -> bytes:
     thumb = img.convert("RGB").copy()
-    thumb.thumbnail((THUMB_SIZE, THUMB_SIZE))
+    thumb.thumbnail((size, size))
     buf = io.BytesIO()
     thumb.save(buf, format="JPEG", quality=80)
     return buf.getvalue()
 
 
+# ── Video helpers ─────────────────────────────────────────────────────────────
+
+def is_video(path) -> bool:
+    return Path(path).suffix.lower() in VIDEO_SUPPORTED
+
+
+def sample_video_frames(path, n: int = N_VIDEO_FRAMES) -> list[Image.Image]:
+    """Grab n frames spread evenly through the video as PIL images."""
+    if not HAS_CV2:
+        return []
+    frames = []
+    cap = cv2.VideoCapture(str(path))
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total > 0:
+            for i in range(n):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (i + 0.5) / n))
+                ok, frame = cap.read()
+                if ok:
+                    frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        else:
+            # Some containers don't report a frame count — read sequentially.
+            raw = []
+            while len(raw) < 150:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                raw.append(frame)
+            step = max(1, len(raw) // n)
+            for frame in raw[::step][:n]:
+                frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    except Exception:
+        pass
+    finally:
+        cap.release()
+    return frames
+
+
+def embed_video(path) -> tuple[np.ndarray | None, Image.Image | None]:
+    """Average the embeddings of sampled frames into one video fingerprint.
+    Returns (embedding, poster_frame) — (None, None) if unreadable."""
+    frames = sample_video_frames(path)
+    if not frames:
+        return None, None
+    vec = normalize(np.mean([embed(f) for f in frames], axis=0))
+    poster = frames[len(frames) // 2]
+    return vec, poster
+
+
+def embed_uploaded_video(uploaded) -> tuple[np.ndarray | None, Image.Image | None]:
+    """OpenCV needs a real file, so spool an uploaded video to a temp path."""
+    suffix = Path(uploaded.name).suffix or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        tmp.write(uploaded.getbuffer())
+        tmp.close()
+        return embed_video(tmp.name)
+    finally:
+        os.unlink(tmp.name)
+
+
 # ── Index build / load ────────────────────────────────────────────────────────
 
 def build_index(photos_dir: Path) -> dict:
-    paths = collect_images(photos_dir)
+    paths = collect_media(photos_dir)
     if not paths:
-        st.error("No images found in that directory.")
+        st.error("No images or videos found in that directory.")
         return {}
 
     bar = st.progress(0.0, text="Building index…")
     valid_paths, vectors = [], []
+    video_thumbs: dict[str, bytes] = {}
+    skipped_videos = 0
     for i, p in enumerate(paths):
         bar.progress((i + 1) / len(paths), text=f"Indexing {i + 1}/{len(paths)}: {p.name}")
-        img = load_image_safe(p)
-        if img is None:
-            continue
-        vectors.append(embed(img))
-        valid_paths.append(str(p))
+        if is_video(p):
+            if not HAS_CV2:
+                skipped_videos += 1
+                continue
+            vec, poster = embed_video(p)
+            if vec is None:
+                continue
+            video_thumbs[str(p)] = make_thumb(poster, POSTER_SIZE)
+            vectors.append(vec)
+            valid_paths.append(str(p))
+        else:
+            img = load_image_safe(p)
+            if img is None:
+                continue
+            vectors.append(embed(img))
+            valid_paths.append(str(p))
     bar.empty()
 
-    index = {"paths": valid_paths, "embeddings": np.array(vectors, dtype=np.float32)}
+    index = {
+        "paths": valid_paths,
+        "embeddings": np.array(vectors, dtype=np.float32),
+        "video_thumbs": video_thumbs,
+    }
     (photos_dir / INDEX_FILENAME).write_bytes(pickle.dumps(index))
-    st.success(f"Index built: {len(valid_paths):,} images.")
+    n_vid = len(video_thumbs)
+    st.success(f"Index built: {len(valid_paths) - n_vid:,} images"
+               + (f" + {n_vid:,} videos" if n_vid else "") + ".")
+    if skipped_videos:
+        st.warning(f"{skipped_videos} video(s) skipped — run "
+                   "`python -m pip install opencv-python`, restart, and rebuild "
+                   "to include them.")
     return index
 
 
@@ -163,6 +267,25 @@ def add_references(gts: dict, name: str, items: list[tuple]) -> None:
         gt["embeddings"] = np.vstack([gt["embeddings"], embs])
         gt["thumbs"].extend(thumbs)
         gt["paths"].extend(paths)
+
+
+def remove_references(gts: dict, name: str, indices: list[int]) -> None:
+    """Remove examples at the given indices; deletes the type if it becomes empty."""
+    gt = gts[name]
+    for i in sorted(set(indices), reverse=True):
+        gt["names"].pop(i)
+        gt["thumbs"].pop(i)
+        gt["paths"].pop(i)
+        gt["embeddings"] = np.delete(gt["embeddings"], i, axis=0)
+    if gt["embeddings"].shape[0] == 0:
+        del gts[name]
+
+
+def outlier_indices(gt: dict, keep_pct: float) -> list[int]:
+    """Indices of the bottom (1-keep_pct) examples ranked by similarity to prototype."""
+    sims = gt["embeddings"] @ prototype(gt)
+    n_remove = max(0, int(round(len(sims) * (1.0 - keep_pct))))
+    return list(np.argsort(sims)[:n_remove].tolist())
 
 
 # ── Search & classification ───────────────────────────────────────────────────
@@ -221,34 +344,58 @@ def export_classification(index: dict, labels: list, out_dir: Path) -> dict:
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
-def show_results(results: list, cols_count: int):
+def show_results(results: list, cols_count: int, index: dict | None = None):
     if not results:
         st.warning("No matches.")
         return
+    video_thumbs = (index or {}).get("video_thumbs", {})
     st.markdown(f"**{len(results)} matches**")
     grid = st.columns(cols_count)
     for i, (path, score) in enumerate(results):
-        img = load_image_safe(path)
-        if img is None:
-            continue
         with grid[i % cols_count]:
-            st.image(img, caption=f"{score:.2f} · {Path(path).name}",
-                     use_container_width=True)
+            if is_video(path):
+                caption = f"🎬 {score:.2f} · {Path(path).name}"
+                thumb = video_thumbs.get(path)
+                if thumb is None and HAS_CV2:
+                    frames = sample_video_frames(path, 1)
+                    thumb = make_thumb(frames[0], POSTER_SIZE) if frames else None
+                if thumb is not None:
+                    st.image(thumb, caption=caption, width=400)
+                else:
+                    st.caption(caption)
+                with st.expander("▶ Play"):
+                    st.video(path)
+            else:
+                img = load_image_safe(path)
+                if img is None:
+                    continue
+                st.image(img, caption=f"{score:.2f} · {Path(path).name}",
+                         width=700)
 
 
 def gather_examples(uploaded, folder_str: str) -> list[tuple]:
-    """Embed uploaded files and/or every image in a folder.
+    """Embed uploaded files and/or every image/video in a folder.
     Returns list of (label, embedding, thumb, source_path_or_None)."""
     items = []
     for f in uploaded or []:
-        img = load_image_safe(f)
-        if img is not None:
-            items.append((f.name, embed(img), make_thumb(img), None))
-    if folder_str and Path(folder_str).is_dir():
-        for p in collect_images(Path(folder_str)):
-            img = load_image_safe(p)
+        if is_video(f.name):
+            vec, poster = embed_uploaded_video(f)
+            if vec is not None:
+                items.append((f.name, vec, make_thumb(poster), None))
+        else:
+            img = load_image_safe(f)
             if img is not None:
-                items.append((p.name, embed(img), make_thumb(img), str(p)))
+                items.append((f.name, embed(img), make_thumb(img), None))
+    if folder_str and Path(folder_str).is_dir():
+        for p in collect_media(Path(folder_str)):
+            if is_video(p):
+                vec, poster = embed_video(p)
+                if vec is not None:
+                    items.append((p.name, vec, make_thumb(poster), str(p)))
+            else:
+                img = load_image_safe(p)
+                if img is not None:
+                    items.append((p.name, embed(img), make_thumb(img), str(p)))
     return items
 
 
@@ -268,6 +415,11 @@ def main():
         st.header("Display")
         top_k = st.slider("Results to show", 5, 120, 24, 1)
         cols_count = st.select_slider("Columns", options=[3, 4, 5, 6, 7, 8], value=6)
+        if not HAS_CV2:
+            st.divider()
+            st.caption("🎬 Video support is off — run "
+                       "`python -m pip install opencv-python`, restart, and "
+                       "rebuild the index to include videos.")
 
     if not photos_dir_str:
         st.info("Enter your photos folder in the sidebar to begin.")
@@ -292,7 +444,10 @@ def main():
     c1, c2 = st.columns([3, 1])
     with c1:
         if index:
-            st.success(f"📁 {len(index['paths']):,} images indexed.")
+            n_vid = sum(1 for p in index["paths"] if is_video(p))
+            n_img = len(index["paths"]) - n_vid
+            st.success(f"📁 {n_img:,} images"
+                       + (f" + {n_vid:,} videos" if n_vid else "") + " indexed.")
         else:
             st.warning("No index found for this folder yet — build one.")
     with c2:
@@ -304,12 +459,15 @@ def main():
         ["🔍 Search by image", "🏷️ Group types", "🗂️ Classify library"]
     )
 
-    # ── Tab 1: search by one or more example images ───────────────────────────
+    # ── Tab 1: search by one or more example images/videos ───────────────────
     with tab_search:
-        st.caption("Find images similar to one or more examples. Add several "
-                   "to search by their combined look.")
+        st.caption("Find media similar to one or more examples (images or "
+                   "videos). Add several to search by their combined look.")
+        up_types = ["jpg", "jpeg", "png", "bmp", "webp"]
+        if HAS_CV2:
+            up_types += ["mp4", "mov", "avi", "3gp", "mkv", "webm", "m4v"]
         uploaded = st.file_uploader(
-            "Example image(s)", type=["jpg", "jpeg", "png", "bmp", "webp"],
+            "Example image(s) or video(s)", type=up_types,
             accept_multiple_files=True, key="search_up",
         )
         path_in = st.text_input("…or a file path", key="search_path",
@@ -318,15 +476,30 @@ def main():
         queries = []  # (label, embedding, thumb)
         skip = set()
         for f in uploaded or []:
-            img = load_image_safe(f)
-            if img is not None:
-                queries.append((f.name, embed(img), make_thumb(img)))
+            if is_video(f.name):
+                vec, poster = embed_uploaded_video(f)
+                if vec is not None:
+                    queries.append((f"🎬 {f.name}", vec, make_thumb(poster)))
+            else:
+                img = load_image_safe(f)
+                if img is not None:
+                    queries.append((f.name, embed(img), make_thumb(img)))
         if path_in:
             if Path(path_in).is_file():
-                img = load_image_safe(path_in)
-                if img is not None:
-                    queries.append((Path(path_in).name, embed(img), make_thumb(img)))
-                    skip.add(str(Path(path_in).resolve()))
+                if is_video(path_in):
+                    if not HAS_CV2:
+                        st.warning("Install opencv-python to query by video.")
+                    else:
+                        vec, poster = embed_video(path_in)
+                        if vec is not None:
+                            queries.append((f"🎬 {Path(path_in).name}", vec,
+                                            make_thumb(poster)))
+                            skip.add(str(Path(path_in).resolve()))
+                else:
+                    img = load_image_safe(path_in)
+                    if img is not None:
+                        queries.append((Path(path_in).name, embed(img), make_thumb(img)))
+                        skip.add(str(Path(path_in).resolve()))
             else:
                 st.warning("That file path was not found.")
 
@@ -338,7 +511,7 @@ def main():
 
             if index:
                 qvec = normalize(np.mean([q[1] for q in queries], axis=0))
-                show_results(rank(qvec, index, top_k, skip=skip), cols_count)
+                show_results(rank(qvec, index, top_k, skip=skip), cols_count, index)
             else:
                 st.info("Build the index first (button above).")
 
@@ -350,7 +523,7 @@ def main():
             st.subheader("Define a group type")
             name = st.text_input("Name", placeholder="e.g. memes, receipts, selfies")
             g_up = st.file_uploader(
-                "Upload example images", type=["jpg", "jpeg", "png", "bmp", "webp"],
+                "Upload example images/videos", type=up_types,
                 accept_multiple_files=True, key="gt_up",
             )
             g_folder = st.text_input(
@@ -374,17 +547,69 @@ def main():
                 st.caption("None defined yet.")
             for gname in list(gts.keys()):
                 gt = gts[gname]
-                with st.expander(f"{gname} · {len(gt['embeddings'])} examples"):
+                n_ex = len(gt["embeddings"])
+                with st.expander(f"{gname} · {n_ex} examples"):
                     thumbs = gt.get("thumbs", [])
+                    names_list = gt.get("names", [])
+
+                    # Thumbnail grid (numbered so users can cross-reference).
+                    preview_n = min(len(thumbs), 30)
                     tcols = st.columns(6)
-                    for i, th in enumerate(thumbs[:18]):
-                        tcols[i % 6].image(th)
-                    if len(thumbs) > 18:
-                        st.caption(f"…and {len(thumbs) - 18} more.")
-                    b1, b2 = st.columns(2)
+                    for i in range(preview_n):
+                        tcols[i % 6].image(thumbs[i], caption=f"#{i}")
+                    if len(thumbs) > preview_n:
+                        st.caption(f"…and {len(thumbs) - preview_n} more.")
+
+                    st.divider()
+
+                    # ── Manual removal ────────────────────────────────────
+                    options = [f"#{i} · {nm}" for i, nm in enumerate(names_list)]
+                    to_remove = st.multiselect(
+                        "Select examples to remove", options, key=f"rm_{gname}",
+                        help="Pick by number — the #s match the thumbnail captions above.",
+                    )
+                    manual_indices = [int(o.split("·")[0].strip("# ")) for o in to_remove]
+
+                    # ── Auto-prune ────────────────────────────────────────
+                    keep_pct = st.slider(
+                        "Auto-prune: keep top % by closeness to centroid",
+                        10, 100, 80, 5, key=f"prune_{gname}", format="%d%%",
+                        help="Lower = remove more outliers. 80% keeps the 80% most "
+                             "representative examples and flags the rest.",
+                    )
+                    auto_idx = outlier_indices(gt, keep_pct / 100.0)
+                    if auto_idx:
+                        st.caption(
+                            f"{len(auto_idx)} outlier(s) flagged "
+                            f"(bottom {100 - keep_pct}% by centroid similarity): "
+                            + ", ".join(f"#{i}" for i in sorted(auto_idx)[:10])
+                            + ("…" if len(auto_idx) > 10 else "")
+                        )
+
+                    # ── Action buttons ────────────────────────────────────
+                    b1, b2, b3, b4 = st.columns(4)
                     if b1.button("🔎 Search library", key=f"use_{gname}"):
                         st.session_state["active_group"] = gname
-                    if b2.button("🗑️ Delete", key=f"del_{gname}"):
+
+                    if b2.button(
+                        f"✂️ Remove {len(to_remove)} selected",
+                        key=f"rm_sel_{gname}",
+                        disabled=not to_remove,
+                    ):
+                        remove_references(gts, gname, manual_indices)
+                        save_group_types(photos_dir, gts)
+                        st.rerun()
+
+                    if b3.button(
+                        f"🧹 Auto-prune {len(auto_idx)}",
+                        key=f"prune_btn_{gname}",
+                        disabled=not auto_idx,
+                    ):
+                        remove_references(gts, gname, auto_idx)
+                        save_group_types(photos_dir, gts)
+                        st.rerun()
+
+                    if b4.button("🗑️ Delete type", key=f"del_{gname}"):
                         del gts[gname]
                         save_group_types(photos_dir, gts)
                         st.rerun()
@@ -411,11 +636,11 @@ def main():
                             except Exception:
                                 pass
                 show_results(rank(prototype(gts[chosen]), index, top_k, skip=skip),
-                             cols_count)
+                             cols_count, index)
 
     # ── Tab 3: classify the whole library ─────────────────────────────────────
     with tab_classify:
-        st.caption("Assign every image to its single nearest group type.")
+        st.caption("Assign every image and video to its single nearest group type.")
         if not gts:
             st.info("Define some group types first.")
         elif not index:
@@ -436,10 +661,10 @@ def main():
                 counts = Counter(l or "_unsorted" for l in labels)
                 total = sum(counts.values())
                 rows = [
-                    {"group type": k, "images": v, "share": f"{v / total:.0%}"}
+                    {"group type": k, "files": v, "share": f"{v / total:.0%}"}
                     for k, v in sorted(counts.items(), key=lambda kv: -kv[1])
                 ]
-                st.markdown(f"**Results · {total:,} images**")
+                st.markdown(f"**Results · {total:,} files**")
                 st.dataframe(rows, use_container_width=True, hide_index=True)
 
                 st.divider()
