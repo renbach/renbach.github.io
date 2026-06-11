@@ -360,7 +360,7 @@ def show_results(results: list, cols_count: int, index: dict | None = None):
                     frames = sample_video_frames(path, 1)
                     thumb = make_thumb(frames[0], POSTER_SIZE) if frames else None
                 if thumb is not None:
-                    st.image(thumb, caption=caption, use_container_width=True)
+                    st.image(thumb, caption=caption, width=400)
                 else:
                     st.caption(caption)
                 with st.expander("▶ Play"):
@@ -370,7 +370,7 @@ def show_results(results: list, cols_count: int, index: dict | None = None):
                 if img is None:
                     continue
                 st.image(img, caption=f"{score:.2f} · {Path(path).name}",
-                         use_container_width=True)
+                         width=700)
 
 
 def gather_examples(uploaded, folder_str: str) -> list[tuple]:
