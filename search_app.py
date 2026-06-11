@@ -93,10 +93,12 @@ def collect_media(root: Path) -> list[Path]:
 
 
 def load_image_safe(src) -> Image.Image | None:
-    """Open a path or an uploaded file object into a fully-loaded PIL image."""
+    """Open a path or an uploaded file object, applying EXIF rotation if present."""
     try:
         img = Image.open(src)
         img.load()
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
         return img
     except Exception:
         return None
@@ -116,6 +118,22 @@ def is_video(path) -> bool:
     return Path(path).suffix.lower() in VIDEO_SUPPORTED
 
 
+_ROTATE = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+           270: cv2.ROTATE_90_COUNTERCLOCKWISE} if HAS_CV2 else {}
+
+
+def _apply_video_rotation(frame: np.ndarray, cap) -> np.ndarray:
+    """Rotate a raw BGR frame to match the video's stored orientation metadata."""
+    try:
+        angle = int(cap.get(cv2.CAP_PROP_ORIENTATION_META))
+        code = _ROTATE.get(angle % 360)
+        if code is not None:
+            return cv2.rotate(frame, code)
+    except Exception:
+        pass
+    return frame
+
+
 def sample_video_frames(path, n: int = N_VIDEO_FRAMES) -> list[Image.Image]:
     """Grab n frames spread evenly through the video as PIL images."""
     if not HAS_CV2:
@@ -129,6 +147,7 @@ def sample_video_frames(path, n: int = N_VIDEO_FRAMES) -> list[Image.Image]:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (i + 0.5) / n))
                 ok, frame = cap.read()
                 if ok:
+                    frame = _apply_video_rotation(frame, cap)
                     frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
         else:
             # Some containers don't report a frame count — read sequentially.
@@ -140,6 +159,7 @@ def sample_video_frames(path, n: int = N_VIDEO_FRAMES) -> list[Image.Image]:
                 raw.append(frame)
             step = max(1, len(raw) // n)
             for frame in raw[::step][:n]:
+                frame = _apply_video_rotation(frame, cap)
                 frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
     except Exception:
         pass
@@ -407,8 +427,8 @@ def gather_examples(uploaded, folder_str: str) -> list[tuple]:
 # ── Main app ──────────────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(page_title="Image Organizer", layout="wide", page_icon="🗂️")
-    st.title("🗂️ Image Search & Group-Type Organizer")
+    st.set_page_config(page_title="Media Organizer", layout="wide", page_icon="🗂️")
+    st.title("🗂️ Media Search & Group-Type Organizer")
 
     with st.sidebar:
         st.header("Library")
